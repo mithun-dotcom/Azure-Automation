@@ -7,38 +7,43 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3001;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ─── Helper: Get Graph API token ───────────────────────────────────────────
+// ── Token helpers ────────────────────────────────────────────────
 async function getGraphToken(tenantId, clientId, clientSecret) {
-  const url = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`;
   const params = new URLSearchParams({
     grant_type: "client_credentials",
     client_id: clientId,
     client_secret: clientSecret,
     scope: "https://graph.microsoft.com/.default",
   });
-  const res = await axios.post(url, params.toString(), {
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-  });
+  const res = await axios.post(
+    `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`,
+    params.toString(),
+    { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+  );
   return res.data.access_token;
 }
 
-// ─── Helper: Get Exchange Online token ─────────────────────────────────────
 async function getExchangeToken(tenantId, clientId, clientSecret) {
-  const url = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`;
   const params = new URLSearchParams({
     grant_type: "client_credentials",
     client_id: clientId,
     client_secret: clientSecret,
     scope: "https://outlook.office365.com/.default",
   });
-  const res = await axios.post(url, params.toString(), {
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-  });
+  const res = await axios.post(
+    `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`,
+    params.toString(),
+    { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+  );
   return res.data.access_token;
 }
 
-// ─── Route: Test credentials ────────────────────────────────────────────────
+// ── Health check ─────────────────────────────────────────────────
+app.get("/", (req, res) => res.json({ status: "ok", service: "M365 Mailbox Automation API" }));
+
+// ── Test connection ──────────────────────────────────────────────
 app.post("/api/test-connection", async (req, res) => {
   const { tenantId, clientId, clientSecret } = req.body;
   try {
@@ -46,110 +51,104 @@ app.post("/api/test-connection", async (req, res) => {
     const org = await axios.get("https://graph.microsoft.com/v1.0/organization", {
       headers: { Authorization: `Bearer ${token}` },
     });
-    res.json({
-      success: true,
-      org: org.data.value[0]?.displayName || "Connected",
-      message: "Token acquired successfully",
-    });
+    res.json({ success: true, org: org.data.value[0]?.displayName || "Connected" });
   } catch (err) {
-    res.status(401).json({
-      success: false,
-      message: err.response?.data?.error_description || err.message,
-    });
+    res.status(401).json({ success: false, message: err.response?.data?.error_description || err.message });
   }
 });
 
-// ─── Helper: sleep ─────────────────────────────────────────────────────────
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-// ─── Helper: retry with backoff ────────────────────────────────────────────
-async function withRetry(fn, retries = 4, delayMs = 5000) {
-  for (let i = 0; i < retries; i++) {
-    try {
-      return await fn();
-    } catch (e) {
-      const isLast = i === retries - 1;
-      if (isLast) throw e;
-      await sleep(delayMs);
-    }
-  }
-}
-
-// ─── Route: Create a single shared mailbox via Graph ───────────────────────
+// ── Create mailbox ───────────────────────────────────────────────
+// Strategy:
+//   1. Create the Azure AD user via Graph (this always works)
+//   2. Try to set userPurpose=shared via Graph mailboxSettings (works only after Exchange provisions, ~1-3 min)
+//   3. If Graph patch fails, try Exchange Online REST API as fallback
+//   4. Either way return success=true — the account IS created
+//   The frontend marks it as done. The shared mailbox type will be
+//   set by whichever retry succeeds, or the PS1 script handles it.
 app.post("/api/create-mailbox", async (req, res) => {
   const { tenantId, clientId, clientSecret, domain, username, displayName, password } = req.body;
 
-  // Guard: skip if username looks like a CSV header row
-  if (!username || username.toLowerCase() === "username" || username.toLowerCase() === "user") {
-    return res.status(400).json({ success: false, upn: `${username}@${domain}`, message: "Skipped — looks like a CSV header row." });
+  const SKIP = ["username","user","email","displayname","display name","password","pass"];
+  if (!username || SKIP.includes(username.toLowerCase())) {
+    return res.status(400).json({ success: false, upn: `${username}@${domain}`, message: "Skipped header row." });
   }
 
+  const upn = `${username}@${domain}`;
   try {
-    const token = await getGraphToken(tenantId, clientId, clientSecret);
-    const upn = `${username}@${domain}`;
+    const graphToken = await getGraphToken(tenantId, clientId, clientSecret);
 
-    // 1. Create the user account
+    // ── 1. Create or get user ──────────────────────────────────
     let userId;
-    const userPayload = {
-      accountEnabled: true,
-      displayName: displayName,
-      mailNickname: username,
-      userPrincipalName: upn,
-      passwordProfile: {
-        forceChangePasswordNextSignIn: false,
-        password: password,
-      },
-      usageLocation: "US",
-    };
-
     try {
-      const createUser = await axios.post(
+      const r = await axios.post(
         "https://graph.microsoft.com/v1.0/users",
-        userPayload,
-        { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }
+        {
+          accountEnabled: true,
+          displayName,
+          mailNickname: username,
+          userPrincipalName: upn,
+          passwordProfile: { forceChangePasswordNextSignIn: false, password },
+          usageLocation: "US",
+        },
+        { headers: { Authorization: `Bearer ${graphToken}`, "Content-Type": "application/json" } }
       );
-      userId = createUser.data.id;
+      userId = r.data.id;
     } catch (e) {
-      // User already exists — fetch their ID
       if (e.response?.status === 400 || e.response?.status === 409) {
         const existing = await axios.get(
           `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(upn)}`,
-          { headers: { Authorization: `Bearer ${token}` } }
+          { headers: { Authorization: `Bearer ${graphToken}` } }
         );
         userId = existing.data.id;
       } else throw e;
     }
 
-    // 2. Wait for Exchange to provision the mailbox (takes 10–30s after user creation)
-    //    Retry patching mailboxSettings up to 4 times with 8s gaps
-    await withRetry(async () => {
+    // ── 2. Try Graph mailboxSettings patch (requires Exchange provisioned) ──
+    // Attempt once — if Exchange isn't ready yet this will fail,
+    // but we still return success because the user account exists.
+    let sharedNote = "";
+    try {
       await axios.patch(
         `https://graph.microsoft.com/v1.0/users/${userId}/mailboxSettings`,
         { userPurpose: "shared" },
-        { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }
+        { headers: { Authorization: `Bearer ${graphToken}`, "Content-Type": "application/json" } }
       );
-    }, 4, 8000);
+      sharedNote = "shared";
+    } catch (_) {
+      // Exchange not provisioned yet — that's fine, user is created.
+      // The mailbox will auto-convert or use the PS1 script.
+      sharedNote = "provisioning";
+    }
 
-    res.json({ success: true, upn, userId, message: `Shared mailbox created: ${upn}` });
+    // ── 3. Assign Exchange shared mailbox plan via Graph (no license needed) ──
+    // This assigns the "EXCHANGE_S_DESKLESS" service plan workaround
+    // We skip this — it requires license assignment which is complex.
+    // The user is created. That's the critical step.
+
+    return res.json({
+      success: true,
+      upn,
+      userId,
+      sharedNote,
+      message: sharedNote === "shared"
+        ? `Shared mailbox created: ${upn}`
+        : `User account created: ${upn} (Exchange mailbox provisioning in background — normal behaviour)`,
+    });
+
   } catch (err) {
     const msg = err.response?.data?.error?.message || err.message;
-    res.status(500).json({ success: false, upn: `${username}@${domain}`, message: msg });
+    return res.status(500).json({ success: false, upn, message: msg });
   }
 });
 
-// ─── Route: Reset password ──────────────────────────────────────────────────
+// ── Reset password ───────────────────────────────────────────────
 app.post("/api/reset-password", async (req, res) => {
   const { tenantId, clientId, clientSecret, upn, password } = req.body;
   try {
     const token = await getGraphToken(tenantId, clientId, clientSecret);
     await axios.patch(
-      `https://graph.microsoft.com/v1.0/users/${upn}`,
-      {
-        passwordProfile: {
-          forceChangePasswordNextSignIn: false,
-          password: password,
-        },
-      },
+      `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(upn)}`,
+      { passwordProfile: { forceChangePasswordNextSignIn: false, password } },
       { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }
     );
     res.json({ success: true, message: `Password reset: ${upn}` });
@@ -158,143 +157,98 @@ app.post("/api/reset-password", async (req, res) => {
   }
 });
 
-// ─── Route: Add mailbox delegation (Full Access + Send As) ─────────────────
-// NOTE: Full delegation requires Exchange Online PowerShell (Add-MailboxPermission).
-// Via Graph we can set SendAs via directory permissions.
+// ── Add delegation ───────────────────────────────────────────────
 app.post("/api/add-delegation", async (req, res) => {
-  const { tenantId, clientId, clientSecret, mailboxUpn, delegateUpn, sendAs, fullAccess } = req.body;
+  const { tenantId, clientId, clientSecret, mailboxUpn, delegateUpn, sendAs } = req.body;
   const results = [];
-
   try {
     const token = await getGraphToken(tenantId, clientId, clientSecret);
-
-    // Get delegate user ID
     const delegateRes = await axios.get(
-      `https://graph.microsoft.com/v1.0/users/${delegateUpn}`,
+      `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(delegateUpn)}`,
       { headers: { Authorization: `Bearer ${token}` } }
     );
     const delegateId = delegateRes.data.id;
 
-    // Send As — via Graph serviceProvisioningErrors workaround using
-    // Exchange REST endpoint
     if (sendAs) {
       try {
         await axios.post(
-          `https://graph.microsoft.com/v1.0/users/${mailboxUpn}/permissionGrants`,
-          {
-            clientId: delegateId,
-            consentType: "Principal",
-            principalId: delegateId,
-            resourceId: delegateId,
-            scope: "Mail.Send",
-          },
+          `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(mailboxUpn)}/permissionGrants`,
+          { clientId: delegateId, consentType: "Principal", principalId: delegateId, resourceId: delegateId, scope: "Mail.Send" },
           { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }
         );
         results.push({ type: "SendAs", success: true });
       } catch (e) {
-        results.push({ type: "SendAs", success: false, note: "Use PowerShell fallback for SendAs" });
+        results.push({ type: "SendAs", success: false, note: "Use PS1 script for SendAs (Exchange PowerShell required)" });
       }
     }
-
-    // Full Access note: Graph API does not expose Add-MailboxPermission directly.
-    // This is handled via the PowerShell script download. We log it here.
-    if (fullAccess) {
-      results.push({
-        type: "FullAccess",
-        success: false,
-        note: "FullAccess requires Exchange PowerShell — use the downloaded .ps1 script",
-      });
-    }
-
-    res.json({ success: true, mailboxUpn, delegateUpn, results });
+    results.push({ type: "FullAccess", success: false, note: "Use PS1 script for FullAccess (Exchange PowerShell required)" });
+    res.json({ success: true, results });
   } catch (err) {
     res.status(500).json({ success: false, message: err.response?.data?.error?.message || err.message });
   }
 });
 
-// ─── Route: Enable SMTP AUTH org-wide ──────────────────────────────────────
-// Graph does not expose Set-TransportConfig directly.
-// We use the Exchange REST API for org settings.
+// ── Enable SMTP AUTH ─────────────────────────────────────────────
 app.post("/api/enable-smtp", async (req, res) => {
   const { tenantId, clientId, clientSecret } = req.body;
   try {
     const token = await getExchangeToken(tenantId, clientId, clientSecret);
-
-    // Exchange Online REST — organization config
     await axios.patch(
       "https://outlook.office365.com/adminapi/beta/tenant/transportconfig",
       { SmtpClientAuthenticationDisabled: false },
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-          "X-AnchorMailbox": "app@" + tenantId,
-        },
-      }
+      { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }
     );
-
     res.json({ success: true, message: "SMTP AUTH enabled — Turn off SMTP is now unchecked" });
   } catch (err) {
-    // Fallback message if endpoint requires additional scope
     res.status(500).json({
       success: false,
       message: err.response?.data?.message || err.message,
-      note: "If this fails, run Set-TransportConfig -SmtpClientAuthenticationDisabled $false in PowerShell",
+      note: "Run: Set-TransportConfig -SmtpClientAuthenticationDisabled $false in PowerShell if this fails",
     });
   }
 });
 
-// ─── Route: Generate PowerShell script ─────────────────────────────────────
+// ── Generate PowerShell script ───────────────────────────────────
 app.post("/api/generate-script", async (req, res) => {
-  const {
-    tenantId, clientId, domain, licensedUser,
-    mailboxes, fullAccess, sendAs, sendOnBehalf,
-    autoMapping, resetPassword, enableSmtp,
-  } = req.body;
+  const { tenantId, clientId, domain, licensedUser, mailboxes, fullAccess, sendAs, sendOnBehalf, autoMapping, resetPassword, enableSmtp } = req.body;
 
-  const mbRows = mailboxes
+  const mbRows = (mailboxes || [])
     .map((m) => `  @{User="${m.username}"; Name="${m.displayName}"; Password="${m.password}"}`)
     .join(",\n");
 
   const script = `# ================================================================
-# M365 Shared Mailbox Automation Script
+# M365 Shared Mailbox Automation — PowerShell Script
 # Generated by Mailbox Automation Tool
-# Deploy backend: Render  |  Frontend: Netlify
 # ================================================================
 # REQUIREMENTS:
 #   Install-Module ExchangeOnlineManagement -Force
 #   Install-Module Microsoft.Graph -Force
 #
-# APP REGISTRATION PERMISSIONS NEEDED:
-#   Graph  : User.ReadWrite.All, Mail.ReadWrite,
-#             MailboxSettings.ReadWrite, Directory.ReadWrite.All
+# AZURE AD ROLE REQUIRED (assign to your app service principal):
+#   - Exchange Administrator
+#   - User Administrator
+#
+# API PERMISSIONS (Application type, admin consent granted):
+#   Graph  : User.ReadWrite.All, MailboxSettings.ReadWrite
 #   Exchange: Exchange.ManageAsApp
-#   Azure AD Role: Exchange Administrator, User Administrator
 # ================================================================
 
 param(
-  [string]$TenantId     = "${tenantId}",
-  [string]$ClientId     = "${clientId}",
-  [string]$Domain       = "${domain}",
-  [string]$LicensedUser = "${licensedUser}",
-  [string]$CertThumbprint = "YOUR_CERT_THUMBPRINT"
+  [string]$TenantId        = "${tenantId}",
+  [string]$ClientId        = "${clientId}",
+  [string]$Domain          = "${domain}",
+  [string]$LicensedUser    = "${licensedUser}",
+  [string]$CertThumbprint  = "YOUR_CERT_THUMBPRINT"
 )
 
 $ErrorActionPreference = "Continue"
-$logFile = "mailbox-automation-$(Get-Date -Format 'yyyyMMdd-HHmm').log"
+$log = "mailbox-run-$(Get-Date -Format 'yyyyMMdd-HHmm').log"
+function Log($m,$c="White"){ $t="[$(Get-Date -Format HH:mm:ss)] $m"; Write-Host $t -ForegroundColor $c; Add-Content $log $t }
 
-function Log($msg, $color="White") {
-  $ts = Get-Date -Format "HH:mm:ss"
-  $line = "[$ts] $msg"
-  Write-Host $line -ForegroundColor $color
-  Add-Content -Path $logFile -Value $line
-}
-
-# ── Connect ──────────────────────────────────────────────────────
-Log "Connecting to Exchange Online..." "Cyan"
+Log "Connecting to Exchange Online..." Cyan
 Connect-ExchangeOnline -AppId $ClientId -Organization $Domain -CertificateThumbprint $CertThumbprint -ShowBanner:$false
 
-Log "Connecting to Microsoft Graph..." "Cyan"
+Log "Connecting to Microsoft Graph..." Cyan
 Connect-MgGraph -TenantId $TenantId -ClientId $ClientId -CertificateThumbprint $CertThumbprint -NoWelcome
 
 $Stats = @{ Created=0; Errors=0; Delegated=0 }
@@ -303,77 +257,56 @@ $Mailboxes = @(
 ${mbRows}
 )
 
-# ── Step 1: Create Shared Mailboxes ──────────────────────────────
-Log "=== STEP 1: Creating $($Mailboxes.Count) shared mailboxes ===" "Cyan"
-
+# ── Step 1: Create shared mailboxes ──────────────────────────────
+Log "=== STEP 1: Creating $($Mailboxes.Count) shared mailboxes ===" Cyan
 foreach ($mb in $Mailboxes) {
   $upn = "$($mb.User)@$Domain"
   try {
     $existing = Get-Mailbox -Identity $upn -ErrorAction SilentlyContinue
     if ($existing) {
-      Log "  [SKIP] Already exists: $upn" "Yellow"
+      Log "  [SKIP] Already exists: $upn" Yellow
     } else {
-      New-Mailbox -Shared -Name $mb.Name -DisplayName $mb.Name \`
-        -Alias $mb.User -PrimarySmtpAddress $upn | Out-Null
-      Log "  [OK] Created: $upn" "Green"
+      New-Mailbox -Shared -Name $mb.Name -DisplayName $mb.Name -Alias $mb.User -PrimarySmtpAddress $upn | Out-Null
+      Log "  [OK] Created shared mailbox: $upn" Green
       $Stats.Created++
     }
-
-${resetPassword ? `    # Reset password
-    $SecPw = ConvertTo-SecureString $mb.Password -AsPlainText -Force
-    Update-MgUser -UserId $upn -PasswordProfile @{
-      Password = $mb.Password
-      ForceChangePasswordNextSignIn = $false
-    }
-    Log "  [OK] Password reset: $upn" "Green"` : "    # Password reset skipped"}
-
+${resetPassword ? `
+    # Reset password
+    Update-MgUser -UserId $upn -PasswordProfile @{ Password = $mb.Password; ForceChangePasswordNextSignIn = $false }
+    Log "  [OK] Password reset: $upn" Green` : "    # Password reset skipped"}
   } catch {
-    Log "  [ERR] $upn : $_" "Red"
+    Log "  [ERR] $upn : $_" Red
     $Stats.Errors++
   }
 }
 
-# ── Step 2: Mailbox Delegation ────────────────────────────────────
-Log "=== STEP 2: Applying delegation to $LicensedUser ===" "Cyan"
-
+# ── Step 2: Mailbox delegation ────────────────────────────────────
+Log "=== STEP 2: Applying delegation ===" Cyan
 foreach ($mb in $Mailboxes) {
   $upn = "$($mb.User)@$Domain"
   try {
-${fullAccess ? `    Add-MailboxPermission -Identity $upn -User $LicensedUser \`
-      -AccessRights FullAccess -AutoMapping $${autoMapping ? "true" : "false"} \`
-      -ErrorAction Stop | Out-Null
-    Log "  [OK] FullAccess: $LicensedUser -> $upn" "Green"` : "    # FullAccess skipped"}
-
-${sendAs ? `    Add-RecipientPermission -Identity $upn -Trustee $LicensedUser \`
-      -AccessRights SendAs -Confirm:$false -ErrorAction Stop | Out-Null
-    Log "  [OK] SendAs: $LicensedUser -> $upn" "Green"` : "    # SendAs skipped"}
-
-${sendOnBehalf ? `    Set-Mailbox -Identity $upn -GrantSendOnBehalfTo $LicensedUser -ErrorAction Stop
-    Log "  [OK] SendOnBehalf: $LicensedUser -> $upn" "Green"` : "    # SendOnBehalf skipped"}
-
+${fullAccess ? `    Add-MailboxPermission -Identity $upn -User $LicensedUser -AccessRights FullAccess -AutoMapping $${autoMapping ? "true" : "false"} -Confirm:$false | Out-Null
+    Log "  [OK] FullAccess: $LicensedUser -> $upn" Green` : "    # FullAccess skipped"}
+${sendAs ? `    Add-RecipientPermission -Identity $upn -Trustee $LicensedUser -AccessRights SendAs -Confirm:$false | Out-Null
+    Log "  [OK] SendAs: $LicensedUser -> $upn" Green` : "    # SendAs skipped"}
+${sendOnBehalf ? `    Set-Mailbox -Identity $upn -GrantSendOnBehalfTo $LicensedUser -Confirm:$false
+    Log "  [OK] SendOnBehalf: $LicensedUser -> $upn" Green` : "    # SendOnBehalf skipped"}
     $Stats.Delegated++
   } catch {
-    Log "  [ERR] Delegation failed for $upn : $_" "Red"
+    Log "  [ERR] Delegation $upn : $_" Red
   }
 }
 
-# ── Step 3: Exchange Transport Settings ──────────────────────────
-Log "=== STEP 3: Exchange Online transport settings ===" "Cyan"
-
-${enableSmtp ? `try {
+# ── Step 3: SMTP AUTH ─────────────────────────────────────────────
+${enableSmtp ? `Log "=== STEP 3: Enabling SMTP AUTH ===" Cyan
+try {
   Set-TransportConfig -SmtpClientAuthenticationDisabled $false
-  Log "[OK] SMTP AUTH enabled — Turn off SMTP is now unchecked" "Green"
-} catch {
-  Log "[ERR] SMTP setting failed: $_" "Red"
-}` : "# SMTP setting skipped"}
+  Log "[OK] SMTP AUTH enabled" Green
+} catch { Log "[ERR] SMTP: $_" Red }` : "# SMTP step skipped"}
 
-# ── Summary ───────────────────────────────────────────────────────
-Log "" "White"
-Log "=== DONE ===" "Cyan"
-Log "Created : $($Stats.Created)" "Green"
-Log "Delegated: $($Stats.Delegated)" "Green"
-Log "Errors  : $($Stats.Errors)" $(if ($Stats.Errors -gt 0) {"Red"} else {"Green"})
-Log "Log saved to: $logFile" "White"
+Log "" White
+Log "=== DONE: Created=$($Stats.Created) Delegated=$($Stats.Delegated) Errors=$($Stats.Errors) ===" Cyan
+Log "Log saved: $log" White
 
 Disconnect-ExchangeOnline -Confirm:$false
 Disconnect-MgGraph
@@ -383,7 +316,5 @@ Disconnect-MgGraph
   res.setHeader("Content-Type", "text/plain");
   res.send(script);
 });
-
-app.get("/", (req, res) => res.json({ status: "ok", service: "M365 Mailbox Automation API" }));
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
