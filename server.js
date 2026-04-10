@@ -59,15 +59,37 @@ app.post("/api/test-connection", async (req, res) => {
   }
 });
 
+// ─── Helper: sleep ─────────────────────────────────────────────────────────
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ─── Helper: retry with backoff ────────────────────────────────────────────
+async function withRetry(fn, retries = 4, delayMs = 5000) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const isLast = i === retries - 1;
+      if (isLast) throw e;
+      await sleep(delayMs);
+    }
+  }
+}
+
 // ─── Route: Create a single shared mailbox via Graph ───────────────────────
 app.post("/api/create-mailbox", async (req, res) => {
   const { tenantId, clientId, clientSecret, domain, username, displayName, password } = req.body;
+
+  // Guard: skip if username looks like a CSV header row
+  if (!username || username.toLowerCase() === "username" || username.toLowerCase() === "user") {
+    return res.status(400).json({ success: false, upn: `${username}@${domain}`, message: "Skipped — looks like a CSV header row." });
+  }
 
   try {
     const token = await getGraphToken(tenantId, clientId, clientSecret);
     const upn = `${username}@${domain}`;
 
     // 1. Create the user account
+    let userId;
     const userPayload = {
       accountEnabled: true,
       displayName: displayName,
@@ -80,7 +102,6 @@ app.post("/api/create-mailbox", async (req, res) => {
       usageLocation: "US",
     };
 
-    let userId;
     try {
       const createUser = await axios.post(
         "https://graph.microsoft.com/v1.0/users",
@@ -89,24 +110,27 @@ app.post("/api/create-mailbox", async (req, res) => {
       );
       userId = createUser.data.id;
     } catch (e) {
-      // User might already exist — try to fetch
+      // User already exists — fetch their ID
       if (e.response?.status === 400 || e.response?.status === 409) {
         const existing = await axios.get(
-          `https://graph.microsoft.com/v1.0/users/${upn}`,
+          `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(upn)}`,
           { headers: { Authorization: `Bearer ${token}` } }
         );
         userId = existing.data.id;
       } else throw e;
     }
 
-    // 2. Convert to shared mailbox via mailboxSettings
-    await axios.patch(
-      `https://graph.microsoft.com/v1.0/users/${userId}/mailboxSettings`,
-      { userPurpose: "shared" },
-      { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }
-    );
+    // 2. Wait for Exchange to provision the mailbox (takes 10–30s after user creation)
+    //    Retry patching mailboxSettings up to 4 times with 8s gaps
+    await withRetry(async () => {
+      await axios.patch(
+        `https://graph.microsoft.com/v1.0/users/${userId}/mailboxSettings`,
+        { userPurpose: "shared" },
+        { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }
+      );
+    }, 4, 8000);
 
-    res.json({ success: true, upn, userId, message: `Mailbox created: ${upn}` });
+    res.json({ success: true, upn, userId, message: `Shared mailbox created: ${upn}` });
   } catch (err) {
     const msg = err.response?.data?.error?.message || err.message;
     res.status(500).json({ success: false, upn: `${username}@${domain}`, message: msg });
