@@ -317,4 +317,223 @@ Disconnect-MgGraph
   res.send(script);
 });
 
+// ── Auto-setup: Start device code flow ──────────────────────────
+app.post("/api/auto-setup/device-code", async (req, res) => {
+  const { tenantId } = req.body;
+  try {
+    const params = new URLSearchParams({
+      client_id: "04b07795-8542-4c44-b3a2-0f47e438e9e2", // Azure CLI public client
+      scope: [
+        "https://graph.microsoft.com/Application.ReadWrite.All",
+        "https://graph.microsoft.com/AppRoleAssignment.ReadWrite.All",
+        "https://graph.microsoft.com/Directory.ReadWrite.All",
+        "https://graph.microsoft.com/Organization.Read.All",
+        "offline_access",
+      ].join(" "),
+    });
+    const r = await axios.post(
+      `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/devicecode`,
+      params.toString(),
+      { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+    );
+    res.json({
+      success: true,
+      device_code: r.data.device_code,
+      user_code: r.data.user_code,
+      verification_uri: r.data.verification_uri,
+      expires_in: r.data.expires_in,
+      interval: r.data.interval,
+      message: r.data.message,
+    });
+  } catch (e) {
+    res.status(400).json({ success: false, message: e.response?.data?.error_description || e.message });
+  }
+});
+
+// ── Auto-setup: Poll for device code token ───────────────────────
+app.post("/api/auto-setup/poll-token", async (req, res) => {
+  const { tenantId, deviceCode } = req.body;
+  try {
+    const params = new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+      client_id: "04b07795-8542-4c44-b3a2-0f47e438e9e2",
+      device_code: deviceCode,
+    });
+    const r = await axios.post(
+      `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`,
+      params.toString(),
+      { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+    );
+    res.json({ success: true, access_token: r.data.access_token });
+  } catch (e) {
+    const err = e.response?.data?.error;
+    if (err === "authorization_pending" || err === "slow_down") {
+      return res.json({ success: false, pending: true, error: err });
+    }
+    res.status(400).json({ success: false, pending: false, message: e.response?.data?.error_description || e.message });
+  }
+});
+
+// ── Auto-setup: Exchange auth code for access token ─────────────
+app.post("/api/auto-setup/token", async (req, res) => {
+  const { tenantId, code, redirectUri, codeVerifier } = req.body;
+  try {
+    const params = new URLSearchParams({
+      grant_type: "authorization_code",
+      client_id: "04b07795-8542-4c44-b3a2-0f47e438e9e2",
+      code, redirect_uri: redirectUri, code_verifier: codeVerifier,
+      scope: "https://graph.microsoft.com/.default offline_access",
+    });
+    const r = await axios.post(
+      `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`,
+      params.toString(),
+      { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+    );
+    res.json({ success: true, access_token: r.data.access_token });
+  } catch (e) {
+    res.status(400).json({ success: false, message: e.response?.data?.error_description || e.message });
+  }
+});
+
+// ── Auto-setup: Create app registration + assign permissions ─────
+app.post("/api/auto-setup/create-app", async (req, res) => {
+  const { accessToken, appName, tenantId } = req.body;
+  const h = { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" };
+  const steps = [];
+
+  try {
+    const log = (msg, ok = true) => steps.push({ msg, ok });
+
+    // 1. Create app registration
+    log("Creating app registration: " + appName);
+    const appRes = await axios.post("https://graph.microsoft.com/v1.0/applications", {
+      displayName: appName,
+      signInAudience: "AzureADMyOrg",
+      requiredResourceAccess: [
+        {
+          resourceAppId: "00000003-0000-0000-c000-000000000000", // Microsoft Graph
+          resourceAccess: [
+            { id: "741f803b-c850-494e-b5df-cde7c675a1ca", type: "Role" }, // User.ReadWrite.All
+            { id: "df021288-bdef-4463-88db-98f22de89214", type: "Role" }, // User.Read.All
+            { id: "e2a3a72e-5f79-4c64-b1b1-878b674786c9", type: "Role" }, // Mail.ReadWrite
+            { id: "931e8a5d-5fa3-4bcc-b695-d7c8e4b95e9a", type: "Role" }, // MailboxSettings.ReadWrite
+            { id: "19dbc75e-c2e2-444c-a770-ec69d8559fc7", type: "Role" }, // Directory.ReadWrite.All
+          ],
+        },
+        {
+          resourceAppId: "00000002-0000-0ff1-ce00-000000000000", // Exchange Online
+          resourceAccess: [
+            { id: "dc50a0fb-09a3-484d-be87-e023b12c6440", type: "Role" }, // Exchange.ManageAsApp
+          ],
+        },
+      ],
+    }, { headers: h });
+
+    const appId = appRes.data.appId;
+    const objectId = appRes.data.id;
+    log("App registered — Client ID: " + appId);
+
+    // 2. Create service principal
+    log("Creating service principal...");
+    await sleep(2000);
+    const spRes = await axios.post("https://graph.microsoft.com/v1.0/servicePrincipals",
+      { appId }, { headers: h }
+    );
+    const spId = spRes.data.id;
+    log("Service principal created");
+
+    // 3. Create client secret
+    log("Generating client secret...");
+    const secretRes = await axios.post(
+      `https://graph.microsoft.com/v1.0/applications/${objectId}/addPassword`,
+      { passwordCredential: { displayName: "M365AutoSecret", endDateTime: new Date(Date.now() + 365*24*60*60*1000*2).toISOString() } },
+      { headers: h }
+    );
+    const clientSecret = secretRes.data.secretText;
+    log("Client secret generated (2-year expiry)");
+
+    // 4. Grant admin consent for Graph permissions
+    log("Granting admin consent for Graph permissions...");
+    await sleep(3000); // wait for SP to propagate
+
+    // Find Graph SP
+    const graphSp = await axios.get(
+      "https://graph.microsoft.com/v1.0/servicePrincipals?$filter=appId eq '00000003-0000-0000-c000-000000000000'",
+      { headers: h }
+    );
+    const graphSpId = graphSp.data.value[0]?.id;
+
+    const graphPermIds = [
+      "741f803b-c850-494e-b5df-cde7c675a1ca",
+      "df021288-bdef-4463-88db-98f22de89214",
+      "e2a3a72e-5f79-4c64-b1b1-878b674786c9",
+      "931e8a5d-5fa3-4bcc-b695-d7c8e4b95e9a",
+      "19dbc75e-c2e2-444c-a770-ec69d8559fc7",
+    ];
+
+    for (const permId of graphPermIds) {
+      try {
+        await axios.post("https://graph.microsoft.com/v1.0/oauth2PermissionGrants", {
+          clientId: spId, consentType: "AllPrincipals",
+          resourceId: graphSpId, scope: permId,
+        }, { headers: h });
+      } catch(_) {}
+    }
+
+    // Grant app role assignments
+    for (const permId of graphPermIds) {
+      try {
+        await axios.post(
+          `https://graph.microsoft.com/v1.0/servicePrincipals/${spId}/appRoleAssignments`,
+          { principalId: spId, resourceId: graphSpId, appRoleId: permId },
+          { headers: h }
+        );
+      } catch(_) {}
+    }
+    log("Graph permissions granted");
+
+    // 5. Grant Exchange.ManageAsApp
+    log("Granting Exchange.ManageAsApp permission...");
+    try {
+      const exchSp = await axios.get(
+        "https://graph.microsoft.com/v1.0/servicePrincipals?$filter=appId eq '00000002-0000-0ff1-ce00-000000000000'",
+        { headers: h }
+      );
+      const exchSpId = exchSp.data.value[0]?.id;
+      await axios.post(
+        `https://graph.microsoft.com/v1.0/servicePrincipals/${spId}/appRoleAssignments`,
+        { principalId: spId, resourceId: exchSpId, appRoleId: "dc50a0fb-09a3-484d-be87-e023b12c6440" },
+        { headers: h }
+      );
+      log("Exchange.ManageAsApp granted");
+    } catch(e) {
+      log("Exchange permission — assign Exchange Administrator role manually in Azure AD", false);
+    }
+
+    // 6. Get tenant domain
+    log("Fetching tenant domain...");
+    let domain = "";
+    try {
+      const orgRes = await axios.get("https://graph.microsoft.com/v1.0/organization", { headers: h });
+      domain = orgRes.data.value[0]?.verifiedDomains?.find(d => d.isDefault)?.name || "";
+      log("Domain: " + domain);
+    } catch(_) {}
+
+    log("✓ Setup complete! Credentials are ready.", true);
+
+    res.json({
+      success: true,
+      steps,
+      result: { appId, clientSecret, tenantId, domain, objectId, spId },
+    });
+
+  } catch (e) {
+    res.status(500).json({
+      success: false,
+      steps,
+      message: e.response?.data?.error?.message || e.message,
+    });
+  }
+});
+
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
