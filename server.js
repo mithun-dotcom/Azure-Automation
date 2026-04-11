@@ -102,45 +102,65 @@ app.post("/api/enable-smtp", async (req, res) => {
 });
 
 // ── Auto-setup: Direct login with admin email + password (ROPC) ──
-// Resource Owner Password Credentials — works when MFA is disabled
-// Falls back to device code suggestion if MFA is required
 app.post("/api/auto-setup/direct-login", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ success: false, message: "Email and password required." });
-
-  // Extract tenant domain from email
   const domain = email.split("@")[1]?.trim();
   if (!domain) return res.status(400).json({ success: false, message: "Invalid email format." });
 
-  try {
-    const params = new URLSearchParams({
-      grant_type: "password",
-      client_id: WIZARD_CLIENT_ID,
-      username: email,
-      password: password,
-      scope: [
-        "https://graph.microsoft.com/Application.ReadWrite.All",
-        "https://graph.microsoft.com/AppRoleAssignment.ReadWrite.All",
-        "https://graph.microsoft.com/Directory.ReadWrite.All",
-        "https://graph.microsoft.com/Organization.Read.All",
-        "offline_access",
-      ].join(" "),
-    });
-    const r = await axios.post(
-      `https://login.microsoftonline.com/${domain}/oauth2/v2.0/token`,
-      params.toString(),
-      { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
-    );
-    res.json({ success: true, access_token: r.data.access_token, domain });
-  } catch (e) {
-    const errCode = e.response?.data?.error;
-    const errDesc = e.response?.data?.error_description || e.message;
-    // MFA required — tell frontend to switch to device code
-    if (errCode === "mfa_required" || errDesc.includes("MFA") || errDesc.includes("multi-factor") || errDesc.includes("AADSTS50076") || errDesc.includes("AADSTS50079")) {
-      return res.status(400).json({ success: false, mfa_required: true, domain, message: "MFA is enabled on this account. Please use the device code method instead." });
+  // Try multiple well-known public client IDs that support ROPC
+  const clientIds = [
+    "1950a258-227b-4e31-a9cf-717495945fc2", // Azure PowerShell — supports ROPC in all tenants
+    "04b07795-8542-4c44-b3a2-0f47e438e9e2", // Azure CLI
+  ];
+
+  let lastError = null;
+  for (const clientId of clientIds) {
+    try {
+      const params = new URLSearchParams({
+        grant_type: "password",
+        client_id: clientId,
+        username: email,
+        password: password,
+        scope: [
+          "https://graph.microsoft.com/Application.ReadWrite.All",
+          "https://graph.microsoft.com/AppRoleAssignment.ReadWrite.All",
+          "https://graph.microsoft.com/Directory.ReadWrite.All",
+          "https://graph.microsoft.com/Organization.Read.All",
+          "offline_access",
+        ].join(" "),
+      });
+      const r = await axios.post(
+        `https://login.microsoftonline.com/${domain}/oauth2/v2.0/token`,
+        params.toString(),
+        { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+      );
+      return res.json({ success: true, access_token: r.data.access_token, domain });
+    } catch (e) {
+      lastError = e;
+      const errCode = e.response?.data?.error;
+      const errDesc = e.response?.data?.error_description || "";
+      // MFA required — no point retrying other clients
+      if (errCode === "mfa_required" || errDesc.includes("AADSTS50076") || errDesc.includes("AADSTS50079") || errDesc.includes("multi-factor")) {
+        return res.status(400).json({ success: false, mfa_required: true, domain, message: "MFA is enabled — please use the device code method instead." });
+      }
+      // Wrong credentials — no point retrying
+      if (errCode === "invalid_grant" || errDesc.includes("Invalid username or password")) {
+        return res.status(400).json({ success: false, message: "Invalid email or password. Please check and try again." });
+      }
+      // ROPC not supported by this client — try next
+      if (errDesc.includes("client_assertion") || errDesc.includes("client_secret") || errDesc.includes("AADSTS7000218")) {
+        continue;
+      }
+      // ROPC disabled in tenant
+      if (errDesc.includes("AADSTS9002327") || errDesc.includes("Resource owner password")) {
+        return res.status(400).json({ success: false, mfa_required: true, domain, message: "Password login is disabled in this tenant. Please use the device code method." });
+      }
     }
-    res.status(400).json({ success: false, message: errDesc });
   }
+
+  const finalMsg = lastError?.response?.data?.error_description || lastError?.message || "Authentication failed";
+  res.status(400).json({ success: false, mfa_required: true, domain, message: finalMsg + " — Try the device code method instead." });
 });
 
 
