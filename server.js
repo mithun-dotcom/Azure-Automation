@@ -164,9 +164,15 @@ app.post("/api/auto-setup/direct-login", async (req, res) => {
 });
 
 
+// Azure PowerShell client — pre-consented in ALL Microsoft 365 tenants, supports device code
+const DEVICE_CLIENT_ID = "1950a258-227b-4e31-a9cf-717495945fc2";
+
 app.post("/api/auto-setup/device-code", async (req, res) => {
   try {
-    const params = new URLSearchParams({ client_id:WIZARD_CLIENT_ID, scope:["https://graph.microsoft.com/Application.ReadWrite.All","https://graph.microsoft.com/AppRoleAssignment.ReadWrite.All","https://graph.microsoft.com/Directory.ReadWrite.All","https://graph.microsoft.com/Organization.Read.All","offline_access"].join(" ") });
+    const params = new URLSearchParams({
+      client_id: DEVICE_CLIENT_ID,
+      scope: ["https://graph.microsoft.com/Application.ReadWrite.All","https://graph.microsoft.com/AppRoleAssignment.ReadWrite.All","https://graph.microsoft.com/Directory.ReadWrite.All","https://graph.microsoft.com/Organization.Read.All","offline_access"].join(" ")
+    });
     const r = await axios.post("https://login.microsoftonline.com/common/oauth2/v2.0/devicecode", params.toString(), { headers:{"Content-Type":"application/x-www-form-urlencoded"} });
     res.json({ success:true, device_code:r.data.device_code, user_code:r.data.user_code, verification_uri:r.data.verification_uri, expires_in:r.data.expires_in, interval:r.data.interval });
   } catch(e) { res.status(400).json({ success:false, message:e.response?.data?.error_description || e.message }); }
@@ -176,7 +182,7 @@ app.post("/api/auto-setup/device-code", async (req, res) => {
 app.post("/api/auto-setup/poll-token", async (req, res) => {
   const { deviceCode } = req.body;
   try {
-    const params = new URLSearchParams({ grant_type:"urn:ietf:params:oauth:grant-type:device_code", client_id:WIZARD_CLIENT_ID, device_code:deviceCode });
+    const params = new URLSearchParams({ grant_type:"urn:ietf:params:oauth:grant-type:device_code", client_id:DEVICE_CLIENT_ID, device_code:deviceCode });
     const r = await axios.post("https://login.microsoftonline.com/common/oauth2/v2.0/token", params.toString(), { headers:{"Content-Type":"application/x-www-form-urlencoded"} });
     res.json({ success:true, access_token:r.data.access_token });
   } catch(e) {
