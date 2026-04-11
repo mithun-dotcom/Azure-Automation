@@ -273,3 +273,76 @@ app.post("/api/generate-script", async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`M365 Automation API v2.0 running on port ${PORT}`));
+
+// ── OAuth popup callback page ────────────────────────────────────
+app.get("/auth/callback", (req, res) => {
+  const code  = req.query.code  || '';
+  const error = req.query.error || '';
+  const data  = JSON.stringify({ type:'MS_AUTH_CALLBACK', code, error });
+  res.send(`<!DOCTYPE html><html><head><title>Signing in...</title>
+<style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#0f1117;color:#e8eaf0}</style>
+</head><body>
+<p>${error ? '❌ Login failed: ' + error : '✓ Login successful — closing window...'}</p>
+<script>
+try { window.opener && window.opener.postMessage(${data}, '*'); } catch(e){}
+setTimeout(function(){ window.close(); }, 1000);
+<\/script>
+</body></html>`);
+});
+
+// ── OAuth: Start popup login ─────────────────────────────────────
+app.post("/api/auto-setup/auth-url", async (req, res) => {
+  const { email, appName } = req.body;
+  const domain = email?.split('@')[1]?.trim();
+  if (!domain) return res.status(400).json({ success: false, message: 'Invalid email' });
+
+  // Use our own Render backend as redirect URI
+  const backendUrl = process.env.BACKEND_URL || `https://${req.headers.host}`;
+  const redirectUri = `${backendUrl}/auth/callback`;
+
+  const state = Buffer.from(JSON.stringify({ domain, appName, ts: Date.now() })).toString('base64url');
+
+  // Azure PowerShell client — broadest tenant coverage for auth code flow
+  const CLIENT_ID = '1950a258-227b-4e31-a9cf-717495945fc2';
+  const scopes = [
+    'https://graph.microsoft.com/Application.ReadWrite.All',
+    'https://graph.microsoft.com/AppRoleAssignment.ReadWrite.All',
+    'https://graph.microsoft.com/Directory.ReadWrite.All',
+    'https://graph.microsoft.com/Organization.Read.All',
+    'offline_access',
+  ].join(' ');
+
+  const authUrl = `https://login.microsoftonline.com/${domain}/oauth2/v2.0/authorize` +
+    `?client_id=${CLIENT_ID}` +
+    `&response_type=code` +
+    `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+    `&scope=${encodeURIComponent(scopes)}` +
+    `&state=${state}` +
+    `&login_hint=${encodeURIComponent(email)}` +
+    `&prompt=select_account`;
+
+  res.json({ success: true, authUrl, redirectUri, state, clientId: CLIENT_ID });
+});
+
+// ── OAuth: Exchange code for token ───────────────────────────────
+app.post("/api/auto-setup/exchange-code", async (req, res) => {
+  const { code, redirectUri, domain } = req.body;
+  const CLIENT_ID = '1950a258-227b-4e31-a9cf-717495945fc2';
+  try {
+    const params = new URLSearchParams({
+      grant_type: 'authorization_code',
+      client_id: CLIENT_ID,
+      code,
+      redirect_uri: redirectUri,
+      scope: 'https://graph.microsoft.com/Application.ReadWrite.All https://graph.microsoft.com/AppRoleAssignment.ReadWrite.All https://graph.microsoft.com/Directory.ReadWrite.All https://graph.microsoft.com/Organization.Read.All offline_access',
+    });
+    const r = await axios.post(
+      `https://login.microsoftonline.com/${domain}/oauth2/v2.0/token`,
+      params.toString(),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+    res.json({ success: true, access_token: r.data.access_token });
+  } catch (e) {
+    res.status(400).json({ success: false, message: e.response?.data?.error_description || e.message });
+  }
+});
