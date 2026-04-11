@@ -101,7 +101,49 @@ app.post("/api/enable-smtp", async (req, res) => {
   } catch(err) { res.status(500).json({ success:false, message:err.response?.data?.message || err.message, note:"Run: Set-TransportConfig -SmtpClientAuthenticationDisabled $false" }); }
 });
 
-// ── Auto-setup: Device code ──────────────────────────────────────
+// ── Auto-setup: Direct login with admin email + password (ROPC) ──
+// Resource Owner Password Credentials — works when MFA is disabled
+// Falls back to device code suggestion if MFA is required
+app.post("/api/auto-setup/direct-login", async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ success: false, message: "Email and password required." });
+
+  // Extract tenant domain from email
+  const domain = email.split("@")[1]?.trim();
+  if (!domain) return res.status(400).json({ success: false, message: "Invalid email format." });
+
+  try {
+    const params = new URLSearchParams({
+      grant_type: "password",
+      client_id: WIZARD_CLIENT_ID,
+      username: email,
+      password: password,
+      scope: [
+        "https://graph.microsoft.com/Application.ReadWrite.All",
+        "https://graph.microsoft.com/AppRoleAssignment.ReadWrite.All",
+        "https://graph.microsoft.com/Directory.ReadWrite.All",
+        "https://graph.microsoft.com/Organization.Read.All",
+        "offline_access",
+      ].join(" "),
+    });
+    const r = await axios.post(
+      `https://login.microsoftonline.com/${domain}/oauth2/v2.0/token`,
+      params.toString(),
+      { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+    );
+    res.json({ success: true, access_token: r.data.access_token, domain });
+  } catch (e) {
+    const errCode = e.response?.data?.error;
+    const errDesc = e.response?.data?.error_description || e.message;
+    // MFA required — tell frontend to switch to device code
+    if (errCode === "mfa_required" || errDesc.includes("MFA") || errDesc.includes("multi-factor") || errDesc.includes("AADSTS50076") || errDesc.includes("AADSTS50079")) {
+      return res.status(400).json({ success: false, mfa_required: true, domain, message: "MFA is enabled on this account. Please use the device code method instead." });
+    }
+    res.status(400).json({ success: false, message: errDesc });
+  }
+});
+
+
 app.post("/api/auto-setup/device-code", async (req, res) => {
   try {
     const params = new URLSearchParams({ client_id:WIZARD_CLIENT_ID, scope:["https://graph.microsoft.com/Application.ReadWrite.All","https://graph.microsoft.com/AppRoleAssignment.ReadWrite.All","https://graph.microsoft.com/Directory.ReadWrite.All","https://graph.microsoft.com/Organization.Read.All","offline_access"].join(" ") });
