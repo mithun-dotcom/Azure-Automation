@@ -266,7 +266,145 @@ Disconnect-MgGraph`;
 app.post("/api/generate-script", async (req, res) => {
   const { tenantId, clientId, domain, licensedUser, mailboxes, fullAccess, sendAs, sendOnBehalf, autoMapping, resetPassword, enableSmtp } = req.body;
   const mbRows = (mailboxes||[]).map(m=>`  @{User="${m.username}"; Name="${m.displayName}"; Password="${m.password}"}`).join(",\n");
-  const script = `# M365 Shared Mailbox Automation\nparam(\n  [string]$TenantId="${tenantId}",[string]$ClientId="${clientId}",[string]$Domain="${domain}",[string]$LicensedUser="${licensedUser}",[string]$Cert="YOUR_CERT_THUMBPRINT"\n)\nConnect-ExchangeOnline -AppId $ClientId -Organization $Domain -CertificateThumbprint $Cert -ShowBanner:$false\nConnect-MgGraph -TenantId $TenantId -ClientId $ClientId -CertificateThumbprint $Cert -NoWelcome\n$Mailboxes=@(\n${mbRows}\n)\nforeach($mb in $Mailboxes){\n  $upn="$($mb.User)@$Domain"\n  try{\n    New-Mailbox -Shared -Name $mb.Name -DisplayName $mb.Name -Alias $mb.User -PrimarySmtpAddress $upn|Out-Null\n    Write-Host "[OK] $upn" -ForegroundColor Green\n${resetPassword?'    Update-MgUser -UserId $upn -PasswordProfile @{Password=$mb.Password;ForceChangePasswordNextSignIn=$false}':''}\n${fullAccess?'    Add-MailboxPermission -Identity $upn -User $LicensedUser -AccessRights FullAccess -AutoMapping $'+( autoMapping?'true':'false')+' -Confirm:$false|Out-Null':''}\n${sendAs?'    Add-RecipientPermission -Identity $upn -Trustee $LicensedUser -AccessRights SendAs -Confirm:$false|Out-Null':''}\n  }catch{ Write-Host "[ERR] $upn : $_" -ForegroundColor Red }\n}\n${enableSmtp?'Set-TransportConfig -SmtpClientAuthenticationDisabled $false':''}\nDisconnect-ExchangeOnline -Confirm:$false`;
+
+  const script = `# ================================================================
+# M365 Shared Mailbox Automation Script
+# This script creates PROPER shared mailboxes via Exchange Online
+# and assigns delegation to the licensed user.
+# ================================================================
+# REQUIREMENTS:
+#   Install-Module ExchangeOnlineManagement -Force
+#   Install-Module Microsoft.Graph -Force
+#
+# HOW TO RUN:
+#   1. Open PowerShell as Administrator
+#   2. Run: .\\Create-SharedMailboxes.ps1
+#   3. Sign in when prompted (Global Admin account)
+# ================================================================
+
+param(
+  [string]$Domain       = "${domain}",
+  [string]$LicensedUser = "${licensedUser}"
+)
+
+$ErrorActionPreference = "Continue"
+$LogFile = "mailbox-run-$(Get-Date -Format 'yyyyMMdd-HHmm').log"
+function Log($msg, $color="White") {
+  $line = "[$(Get-Date -Format 'HH:mm:ss')] $msg"
+  Write-Host $line -ForegroundColor $color
+  Add-Content -Path $LogFile -Value $line
+}
+
+# ── Connect interactively (handles MFA automatically) ────────────
+Log "Connecting to Exchange Online..." Cyan
+Connect-ExchangeOnline -UserPrincipalName $LicensedUser -ShowBanner:$false
+
+Log "Connecting to Microsoft Graph..." Cyan
+Connect-MgGraph -Scopes "User.ReadWrite.All" -NoWelcome
+
+$Stats = @{ Created=0; Skipped=0; Errors=0; Delegated=0 }
+
+$Mailboxes = @(
+${mbRows}
+)
+
+# ── Step 1: Create shared mailboxes via Exchange directly ─────────
+Log "=== STEP 1: Creating $($Mailboxes.Count) shared mailboxes ===" Cyan
+
+foreach ($mb in $Mailboxes) {
+  $upn = "$($mb.User)@$Domain"
+  try {
+    $existing = Get-Mailbox -Identity $upn -ErrorAction SilentlyContinue
+    if ($existing) {
+      Log "  [SKIP] Already exists: $upn" Yellow
+      $Stats.Skipped++
+    } else {
+      # Create as shared mailbox directly in Exchange — appears immediately
+      New-Mailbox -Shared `
+        -Name $mb.Name `
+        -DisplayName $mb.Name `
+        -Alias $mb.User `
+        -PrimarySmtpAddress $upn | Out-Null
+      Log "  [OK] Created shared mailbox: $upn" Green
+      $Stats.Created++
+
+      ${resetPassword ? `
+      # Set password
+      try {
+        Update-MgUser -UserId $upn -PasswordProfile @{
+          Password = $mb.Password
+          ForceChangePasswordNextSignIn = $false
+        } -ErrorAction Stop
+        Log "  [OK] Password set: $upn" Green
+      } catch { Log "  [WARN] Password: $_" Yellow }` : '      # Password reset skipped'}
+    }
+  } catch {
+    Log "  [ERR] Failed to create $upn : $_" Red
+    $Stats.Errors++
+  }
+}
+
+# ── Step 2: Apply mailbox delegation ─────────────────────────────
+Log "" White
+Log "=== STEP 2: Applying delegation ($LicensedUser gets access to all) ===" Cyan
+
+foreach ($mb in $Mailboxes) {
+  $upn = "$($mb.User)@$Domain"
+  try {
+    $mbx = Get-Mailbox -Identity $upn -ErrorAction SilentlyContinue
+    if (!$mbx) { Log "  [SKIP] Mailbox not found: $upn" Yellow; continue }
+
+    ${fullAccess ? `
+    Add-MailboxPermission `
+      -Identity $upn `
+      -User $LicensedUser `
+      -AccessRights FullAccess `
+      -AutoMapping $${autoMapping ? 'true' : 'false'} `
+      -Confirm:$false | Out-Null
+    Log "  [OK] FullAccess: $LicensedUser → $upn" Green` : '    # FullAccess skipped'}
+
+    ${sendAs ? `
+    Add-RecipientPermission `
+      -Identity $upn `
+      -Trustee $LicensedUser `
+      -AccessRights SendAs `
+      -Confirm:$false | Out-Null
+    Log "  [OK] SendAs: $LicensedUser → $upn" Green` : '    # SendAs skipped'}
+
+    ${sendOnBehalf ? `
+    Set-Mailbox -Identity $upn -GrantSendOnBehalfTo $LicensedUser -Confirm:$false
+    Log "  [OK] SendOnBehalf: $LicensedUser → $upn" Green` : '    # SendOnBehalf skipped'}
+
+    $Stats.Delegated++
+  } catch {
+    Log "  [ERR] Delegation failed for $upn : $_" Red
+  }
+}
+
+# ── Step 3: Enable SMTP AUTH ──────────────────────────────────────
+${enableSmtp ? `
+Log "" White
+Log "=== STEP 3: Enabling SMTP AUTH ===" Cyan
+try {
+  Set-TransportConfig -SmtpClientAuthenticationDisabled $false
+  Log "[OK] SMTP AUTH enabled — Turn off SMTP is now unchecked" Green
+} catch { Log "[ERR] SMTP: $_" Red }` : '# SMTP step skipped'}
+
+# ── Summary ───────────────────────────────────────────────────────
+Log "" White
+Log "================================================================" Cyan
+Log "  DONE!" Cyan
+Log "  Created  : $($Stats.Created)" Green
+Log "  Skipped  : $($Stats.Skipped)" Yellow
+Log "  Errors   : $($Stats.Errors)" $(if ($Stats.Errors -gt 0) { "Red" } else { "Green" })
+Log "  Delegated: $($Stats.Delegated)" Green
+Log "  Log file : $LogFile" White
+Log "================================================================" Cyan
+
+Disconnect-ExchangeOnline -Confirm:$false
+Disconnect-MgGraph
+`;
+
   res.setHeader("Content-Disposition","attachment; filename=Create-SharedMailboxes.ps1");
   res.setHeader("Content-Type","text/plain");
   res.send(script);
