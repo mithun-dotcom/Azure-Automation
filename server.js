@@ -1,486 +1,303 @@
 const express = require("express");
-const cors = require("cors");
-const axios = require("axios");
+const cors    = require("cors");
+const axios   = require("axios");
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
-const PORT = process.env.PORT || 3001;
+const PORT  = process.env.PORT || 3001;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const WIZARD_CLIENT_ID = "de8bc8b5-d9f9-48b1-a8ad-b748da725064";
 
-// ── Token helpers ────────────────────────────────────────────────
+// ── Token helpers ─────────────────────────────────────────────────
 async function getGraphToken(tenantId, clientId, clientSecret) {
-  const params = new URLSearchParams({ grant_type:"client_credentials", client_id:clientId, client_secret:clientSecret, scope:"https://graph.microsoft.com/.default" });
-  const r = await axios.post(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`, params.toString(), { headers:{"Content-Type":"application/x-www-form-urlencoded"} });
+  const p = new URLSearchParams({
+    grant_type: "client_credentials",
+    client_id: clientId,
+    client_secret: clientSecret,
+    scope: "https://graph.microsoft.com/.default",
+  });
+  const r = await axios.post(
+    `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`,
+    p.toString(),
+    { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+  );
   return r.data.access_token;
 }
+
 async function getExchangeToken(tenantId, clientId, clientSecret) {
-  const params = new URLSearchParams({ grant_type:"client_credentials", client_id:clientId, client_secret:clientSecret, scope:"https://outlook.office365.com/.default" });
-  const r = await axios.post(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`, params.toString(), { headers:{"Content-Type":"application/x-www-form-urlencoded"} });
+  const p = new URLSearchParams({
+    grant_type: "client_credentials",
+    client_id: clientId,
+    client_secret: clientSecret,
+    scope: "https://outlook.office365.com/.default",
+  });
+  const r = await axios.post(
+    `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`,
+    p.toString(),
+    { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+  );
   return r.data.access_token;
 }
 
-// ── Health ───────────────────────────────────────────────────────
-app.get("/", (req, res) => res.json({ status:"ok", version:"2.0", service:"M365 Mailbox Automation API" }));
+// ── Health ────────────────────────────────────────────────────────
+app.get("/", (req, res) =>
+  res.json({ status: "ok", version: "4.0", service: "M365 Mailbox Automation" })
+);
 
-// ── Test connection ──────────────────────────────────────────────
+// ── Test connection ───────────────────────────────────────────────
 app.post("/api/test-connection", async (req, res) => {
   const { tenantId, clientId, clientSecret } = req.body;
   try {
     const token = await getGraphToken(tenantId, clientId, clientSecret);
-    const org = await axios.get("https://graph.microsoft.com/v1.0/organization", { headers:{ Authorization:`Bearer ${token}` } });
-    res.json({ success:true, org:org.data.value[0]?.displayName || "Connected" });
-  } catch(err) { res.status(401).json({ success:false, message:err.response?.data?.error_description || err.message }); }
+    const org = await axios.get("https://graph.microsoft.com/v1.0/organization", {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    res.json({ success: true, org: org.data.value[0]?.displayName || "Connected" });
+  } catch (err) {
+    res.status(401).json({
+      success: false,
+      message: err.response?.data?.error_description || err.message,
+    });
+  }
 });
 
-// ── Create mailbox ───────────────────────────────────────────────
+// ── Create shared mailbox ─────────────────────────────────────────
+// Strategy:
+//   1. Create user via Graph API
+//   2. Convert to shared mailbox via Graph mailboxSettings
+//   3. If Exchange not provisioned yet, retry up to 6x with 10s gaps
 app.post("/api/create-mailbox", async (req, res) => {
   const { tenantId, clientId, clientSecret, domain, username, displayName, password } = req.body;
-  const SKIP = ["username","user","email","displayname","display name","password","pass"];
-  if (!username || SKIP.includes(username.toLowerCase())) return res.status(400).json({ success:false, upn:`${username}@${domain}`, message:"Skipped header row." });
+
+  const skip = ["username", "user", "email", "displayname", "password", "pass"];
+  if (!username || skip.includes(username.toLowerCase())) {
+    return res.status(400).json({ success: false, upn: `${username}@${domain}`, message: "Skipped header row." });
+  }
+
   const upn = `${username}@${domain}`;
   try {
     const token = await getGraphToken(tenantId, clientId, clientSecret);
+
+    // Step 1: Create or get user
     let userId;
     try {
-      const r = await axios.post("https://graph.microsoft.com/v1.0/users", { accountEnabled:true, displayName, mailNickname:username, userPrincipalName:upn, passwordProfile:{ forceChangePasswordNextSignIn:false, password }, usageLocation:"US" }, { headers:{ Authorization:`Bearer ${token}`, "Content-Type":"application/json" } });
+      const r = await axios.post(
+        "https://graph.microsoft.com/v1.0/users",
+        {
+          accountEnabled: true,
+          displayName,
+          mailNickname: username,
+          userPrincipalName: upn,
+          passwordProfile: { forceChangePasswordNextSignIn: false, password },
+          usageLocation: "US",
+        },
+        { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }
+      );
       userId = r.data.id;
-    } catch(e) {
+    } catch (e) {
       if (e.response?.status === 400 || e.response?.status === 409) {
-        const ex = await axios.get(`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(upn)}`, { headers:{ Authorization:`Bearer ${token}` } });
+        // User already exists
+        const ex = await axios.get(
+          `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(upn)}`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
         userId = ex.data.id;
       } else throw e;
     }
-    let sharedNote = "provisioning";
-    try {
-      await axios.patch(`https://graph.microsoft.com/v1.0/users/${userId}/mailboxSettings`, { userPurpose:"shared" }, { headers:{ Authorization:`Bearer ${token}`, "Content-Type":"application/json" } });
-      sharedNote = "shared";
-    } catch(_) {}
-    res.json({ success:true, upn, userId, sharedNote, message: sharedNote==="shared" ? `Shared mailbox created: ${upn}` : `User created: ${upn} (Exchange provisioning in background)` });
-  } catch(err) { res.status(500).json({ success:false, upn, message:err.response?.data?.error?.message || err.message }); }
+
+    // Step 2: Convert to shared mailbox — retry until Exchange provisions it
+    let converted = false;
+    for (let attempt = 1; attempt <= 6; attempt++) {
+      try {
+        await axios.patch(
+          `https://graph.microsoft.com/v1.0/users/${userId}/mailboxSettings`,
+          { userPurpose: "shared" },
+          { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }
+        );
+        converted = true;
+        break;
+      } catch (e) {
+        const msg = e.response?.data?.error?.message || "";
+        const notReady = msg.includes("inactive") || msg.includes("soft-deleted") ||
+          msg.includes("on-premise") || msg.includes("MailboxNotEnabled") || e.response?.status === 404;
+        if (notReady && attempt < 6) {
+          await sleep(10000); // wait 10s and retry
+          continue;
+        }
+        break; // non-retryable or max retries — user still created
+      }
+    }
+
+    res.json({
+      success: true,
+      upn,
+      userId,
+      converted,
+      message: converted
+        ? `Shared mailbox created: ${upn}`
+        : `User created: ${upn} — Exchange provisioning in background (run PS1 to finalize)`,
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      upn,
+      message: err.response?.data?.error?.message || err.message,
+    });
+  }
 });
 
-// ── Reset password ───────────────────────────────────────────────
+// ── Reset password ────────────────────────────────────────────────
 app.post("/api/reset-password", async (req, res) => {
   const { tenantId, clientId, clientSecret, upn, password } = req.body;
   try {
     const token = await getGraphToken(tenantId, clientId, clientSecret);
-    await axios.patch(`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(upn)}`, { passwordProfile:{ forceChangePasswordNextSignIn:false, password } }, { headers:{ Authorization:`Bearer ${token}`, "Content-Type":"application/json" } });
-    res.json({ success:true, message:`Password reset: ${upn}` });
-  } catch(err) { res.status(500).json({ success:false, message:err.response?.data?.error?.message || err.message }); }
+    await axios.patch(
+      `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(upn)}`,
+      { passwordProfile: { forceChangePasswordNextSignIn: false, password } },
+      { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }
+    );
+    res.json({ success: true, message: `Password reset: ${upn}` });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.response?.data?.error?.message || err.message });
+  }
 });
 
-// ── Add delegation ───────────────────────────────────────────────
+// ── Mailbox delegation ────────────────────────────────────────────
+// Graph does not support Add-MailboxPermission (FullAccess).
+// We return a clear message so the frontend shows it correctly.
+// The PS1 script handles FullAccess via Exchange PowerShell.
 app.post("/api/add-delegation", async (req, res) => {
-  const { tenantId, clientId, clientSecret, mailboxUpn, delegateUpn, sendAs } = req.body;
-  const results = [];
-  try {
-    const token = await getGraphToken(tenantId, clientId, clientSecret);
-    const dRes = await axios.get(`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(delegateUpn)}`, { headers:{ Authorization:`Bearer ${token}` } });
-    const delegateId = dRes.data.id;
-    if (sendAs) {
-      try {
-        await axios.post(`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(mailboxUpn)}/permissionGrants`, { clientId:delegateId, consentType:"Principal", principalId:delegateId, resourceId:delegateId, scope:"Mail.Send" }, { headers:{ Authorization:`Bearer ${token}`, "Content-Type":"application/json" } });
-        results.push({ type:"SendAs", success:true });
-      } catch(e) { results.push({ type:"SendAs", success:false, note:"Use PS1 script for SendAs" }); }
-    }
-    results.push({ type:"FullAccess", success:false, note:"Use PS1 script for FullAccess (Exchange PowerShell required)" });
-    res.json({ success:true, results });
-  } catch(err) { res.status(500).json({ success:false, message:err.response?.data?.error?.message || err.message }); }
+  res.json({
+    success: true,
+    results: [
+      { type: "FullAccess", success: false, note: "Use Download PS1 script for FullAccess delegation" },
+      { type: "SendAs",     success: false, note: "Use Download PS1 script for SendAs delegation" },
+    ],
+  });
 });
 
-// ── Enable SMTP ──────────────────────────────────────────────────
+// ── Enable SMTP AUTH ──────────────────────────────────────────────
 app.post("/api/enable-smtp", async (req, res) => {
   const { tenantId, clientId, clientSecret } = req.body;
   try {
     const token = await getExchangeToken(tenantId, clientId, clientSecret);
-    await axios.patch("https://outlook.office365.com/adminapi/beta/tenant/transportconfig", { SmtpClientAuthenticationDisabled:false }, { headers:{ Authorization:`Bearer ${token}`, "Content-Type":"application/json" } });
-    res.json({ success:true, message:"SMTP AUTH enabled" });
-  } catch(err) { res.status(500).json({ success:false, message:err.response?.data?.message || err.message, note:"Run: Set-TransportConfig -SmtpClientAuthenticationDisabled $false" }); }
-});
-
-// ── Auto-setup: Direct login with admin email + password (ROPC) ──
-app.post("/api/auto-setup/direct-login", async (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password) return res.status(400).json({ success: false, message: "Email and password required." });
-  const domain = email.split("@")[1]?.trim();
-  if (!domain) return res.status(400).json({ success: false, message: "Invalid email format." });
-
-  // Try multiple well-known public client IDs that support ROPC
-  const clientIds = [
-    "1950a258-227b-4e31-a9cf-717495945fc2", // Azure PowerShell — supports ROPC in all tenants
-    "04b07795-8542-4c44-b3a2-0f47e438e9e2", // Azure CLI
-  ];
-
-  let lastError = null;
-  for (const clientId of clientIds) {
-    try {
-      const params = new URLSearchParams({
-        grant_type: "password",
-        client_id: clientId,
-        username: email,
-        password: password,
-        scope: [
-          "https://graph.microsoft.com/Application.ReadWrite.All",
-          "https://graph.microsoft.com/AppRoleAssignment.ReadWrite.All",
-          "https://graph.microsoft.com/Directory.ReadWrite.All",
-          "https://graph.microsoft.com/Organization.Read.All",
-          "offline_access",
-        ].join(" "),
-      });
-      const r = await axios.post(
-        `https://login.microsoftonline.com/${domain}/oauth2/v2.0/token`,
-        params.toString(),
-        { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
-      );
-      return res.json({ success: true, access_token: r.data.access_token, domain });
-    } catch (e) {
-      lastError = e;
-      const errCode = e.response?.data?.error;
-      const errDesc = e.response?.data?.error_description || "";
-      // MFA required — no point retrying other clients
-      if (errCode === "mfa_required" || errDesc.includes("AADSTS50076") || errDesc.includes("AADSTS50079") || errDesc.includes("multi-factor")) {
-        return res.status(400).json({ success: false, mfa_required: true, domain, message: "MFA is enabled — please use the device code method instead." });
-      }
-      // Wrong credentials — no point retrying
-      if (errCode === "invalid_grant" || errDesc.includes("Invalid username or password")) {
-        return res.status(400).json({ success: false, message: "Invalid email or password. Please check and try again." });
-      }
-      // ROPC not supported by this client — try next
-      if (errDesc.includes("client_assertion") || errDesc.includes("client_secret") || errDesc.includes("AADSTS7000218")) {
-        continue;
-      }
-      // ROPC disabled in tenant
-      if (errDesc.includes("AADSTS9002327") || errDesc.includes("Resource owner password")) {
-        return res.status(400).json({ success: false, mfa_required: true, domain, message: "Password login is disabled in this tenant. Please use the device code method." });
-      }
-    }
-  }
-
-  const finalMsg = lastError?.response?.data?.error_description || lastError?.message || "Authentication failed";
-  res.status(400).json({ success: false, mfa_required: true, domain, message: finalMsg + " — Try the device code method instead." });
-});
-
-
-// Azure PowerShell client — pre-consented in ALL Microsoft 365 tenants, supports device code
-const DEVICE_CLIENT_ID = "1950a258-227b-4e31-a9cf-717495945fc2";
-
-app.post("/api/auto-setup/device-code", async (req, res) => {
-  try {
-    const params = new URLSearchParams({
-      client_id: DEVICE_CLIENT_ID,
-      scope: ["https://graph.microsoft.com/Application.ReadWrite.All","https://graph.microsoft.com/AppRoleAssignment.ReadWrite.All","https://graph.microsoft.com/Directory.ReadWrite.All","https://graph.microsoft.com/Organization.Read.All","offline_access"].join(" ")
-    });
-    const r = await axios.post("https://login.microsoftonline.com/common/oauth2/v2.0/devicecode", params.toString(), { headers:{"Content-Type":"application/x-www-form-urlencoded"} });
-    res.json({ success:true, device_code:r.data.device_code, user_code:r.data.user_code, verification_uri:r.data.verification_uri, expires_in:r.data.expires_in, interval:r.data.interval });
-  } catch(e) { res.status(400).json({ success:false, message:e.response?.data?.error_description || e.message }); }
-});
-
-// ── Auto-setup: Poll token ───────────────────────────────────────
-app.post("/api/auto-setup/poll-token", async (req, res) => {
-  const { deviceCode } = req.body;
-  try {
-    const params = new URLSearchParams({ grant_type:"urn:ietf:params:oauth:grant-type:device_code", client_id:DEVICE_CLIENT_ID, device_code:deviceCode });
-    const r = await axios.post("https://login.microsoftonline.com/common/oauth2/v2.0/token", params.toString(), { headers:{"Content-Type":"application/x-www-form-urlencoded"} });
-    res.json({ success:true, access_token:r.data.access_token });
-  } catch(e) {
-    const err = e.response?.data?.error;
-    if (err === "authorization_pending" || err === "slow_down") return res.json({ success:false, pending:true });
-    res.status(400).json({ success:false, pending:false, message:e.response?.data?.error_description || e.message });
+    await axios.patch(
+      "https://outlook.office365.com/adminapi/beta/tenant/transportconfig",
+      { SmtpClientAuthenticationDisabled: false },
+      { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }
+    );
+    res.json({ success: true, message: "SMTP AUTH enabled — Turn off SMTP is now unchecked" });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.response?.data?.message || err.message });
   }
 });
 
-// ── Auto-setup: Create app registration ─────────────────────────
-app.post("/api/auto-setup/create-app", async (req, res) => {
-  const { accessToken, appName, tenantId } = req.body;
-  const h = { Authorization:`Bearer ${accessToken}`, "Content-Type":"application/json" };
-  const steps = [];
-  const log = (msg, ok=true) => steps.push({ msg, ok });
-  try {
-    log("Creating app registration: " + appName);
-    const appRes = await axios.post("https://graph.microsoft.com/v1.0/applications", { displayName:appName, signInAudience:"AzureADMyOrg", requiredResourceAccess:[{ resourceAppId:"00000003-0000-0000-c000-000000000000", resourceAccess:[{ id:"741f803b-c850-494e-b5df-cde7c675a1ca",type:"Role"},{ id:"df021288-bdef-4463-88db-98f22de89214",type:"Role"},{ id:"e2a3a72e-5f79-4c64-b1b1-878b674786c9",type:"Role"},{ id:"931e8a5d-5fa3-4bcc-b695-d7c8e4b95e9a",type:"Role"},{ id:"19dbc75e-c2e2-444c-a770-ec69d8559fc7",type:"Role"}]},{ resourceAppId:"00000002-0000-0ff1-ce00-000000000000", resourceAccess:[{ id:"dc50a0fb-09a3-484d-be87-e023b12c6440",type:"Role"}]}] }, { headers:h });
-    const appId = appRes.data.appId, objectId = appRes.data.id;
-    log("App registered — Client ID: " + appId);
-    await sleep(2000);
-    const spRes = await axios.post("https://graph.microsoft.com/v1.0/servicePrincipals", { appId }, { headers:h });
-    const spId = spRes.data.id;
-    log("Service principal created");
-    const secretRes = await axios.post(`https://graph.microsoft.com/v1.0/applications/${objectId}/addPassword`, { passwordCredential:{ displayName:"M365AutoSecret", endDateTime:new Date(Date.now()+365*24*60*60*1000*2).toISOString() } }, { headers:h });
-    const clientSecret = secretRes.data.secretText;
-    log("Client secret generated (2-year expiry)");
-    await sleep(5000);
-    const graphSp = await axios.get("https://graph.microsoft.com/v1.0/servicePrincipals?$filter=appId eq '00000003-0000-0000-c000-000000000000'", { headers:h });
-    const graphSpId = graphSp.data.value[0]?.id;
-    for (const permId of ["741f803b-c850-494e-b5df-cde7c675a1ca","df021288-bdef-4463-88db-98f22de89214","e2a3a72e-5f79-4c64-b1b1-878b674786c9","931e8a5d-5fa3-4bcc-b695-d7c8e4b95e9a","19dbc75e-c2e2-444c-a770-ec69d8559fc7"]) {
-      try { await axios.post(`https://graph.microsoft.com/v1.0/servicePrincipals/${spId}/appRoleAssignments`, { principalId:spId, resourceId:graphSpId, appRoleId:permId }, { headers:h }); } catch(_) {}
-    }
-    log("Graph permissions granted & admin consent applied");
-    try {
-      const exchSp = await axios.get("https://graph.microsoft.com/v1.0/servicePrincipals?$filter=appId eq '00000002-0000-0ff1-ce00-000000000000'", { headers:h });
-      await axios.post(`https://graph.microsoft.com/v1.0/servicePrincipals/${spId}/appRoleAssignments`, { principalId:spId, resourceId:exchSp.data.value[0]?.id, appRoleId:"dc50a0fb-09a3-484d-be87-e023b12c6440" }, { headers:h });
-      log("Exchange.ManageAsApp granted");
-    } catch(e) { log("Exchange permission — assign Exchange Administrator role manually", false); }
-    let domain = "";
-    try { const orgRes = await axios.get("https://graph.microsoft.com/v1.0/organization", { headers:h }); domain = orgRes.data.value[0]?.verifiedDomains?.find(d=>d.isDefault)?.name || ""; log("Domain: " + domain); } catch(_) {}
-    log("Setup complete! Credentials ready.", true);
-    res.json({ success:true, steps, result:{ appId, clientSecret, tenantId, domain, objectId, spId } });
-  } catch(e) { res.status(500).json({ success:false, steps, message:e.response?.data?.error?.message || e.message }); }
-});
+// ── Generate PowerShell script ────────────────────────────────────
+// This script completes what the web app can't do via Graph API:
+//   - Converts users to proper shared mailboxes in Exchange
+//   - Delegates FullAccess + SendAs to the licensed user
+// Uses Tenant ID + Client ID + Client Secret — no interactive login
+app.post("/api/generate-script", (req, res) => {
+  const { tenantId, clientId, clientSecret, domain, licensedUser, mailboxes, enableSmtp } = req.body;
 
-// ── Auto-setup: Generate registration script ─────────────────────
-app.post("/api/auto-setup/generate-reg-script", async (req, res) => {
-  const { appName, domain } = req.body;
-  const name = appName || "M365 Mailbox Automation";
-  const script = `# M365 App Registration Script — run as Global Admin
-# Install-Module Microsoft.Graph -Force
+  const rows = (mailboxes || [])
+    .map((m) => `  @{User="${m.username}"; Name="${m.displayName}"}`)
+    .join(",\n");
 
-Connect-MgGraph -Scopes "Application.ReadWrite.All","AppRoleAssignment.ReadWrite.All","Directory.ReadWrite.All","Organization.Read.All" -TenantId "${domain||'YOUR_DOMAIN'}" -NoWelcome
+  const smtpLine = enableSmtp
+    ? `try { Set-TransportConfig -SmtpClientAuthenticationDisabled $false\n  Write-Host "[OK] SMTP AUTH enabled" -ForegroundColor Green } catch { Write-Host "[ERR] SMTP: $_" -ForegroundColor Red }`
+    : "# SMTP step skipped";
 
-$app = New-MgApplication -DisplayName "${name}" -SignInAudience "AzureADMyOrg" -RequiredResourceAccess @(@{ResourceAppId="00000003-0000-0000-c000-000000000000";ResourceAccess=@(@{Id="741f803b-c850-494e-b5df-cde7c675a1ca";Type="Role"},@{Id="df021288-bdef-4463-88db-98f22de89214";Type="Role"},@{Id="e2a3a72e-5f79-4c64-b1b1-878b674786c9";Type="Role"},@{Id="931e8a5d-5fa3-4bcc-b695-d7c8e4b95e9a";Type="Role"},@{Id="19dbc75e-c2e2-444c-a770-ec69d8559fc7";Type="Role"})},@{ResourceAppId="00000002-0000-0ff1-ce00-000000000000";ResourceAccess=@(@{Id="dc50a0fb-09a3-484d-be87-e023b12c6440";Type="Role"})})
-Start-Sleep 3
-$sp = New-MgServicePrincipal -AppId $app.AppId
-$secret = Add-MgApplicationPassword -ApplicationId $app.Id -PasswordCredential @{DisplayName="AutoSecret";EndDateTime=(Get-Date).AddYears(2)}
-Start-Sleep 8
-$graphSp = Get-MgServicePrincipal -Filter "AppId eq '00000003-0000-0000-c000-000000000000'"
-@("741f803b-c850-494e-b5df-cde7c675a1ca","df021288-bdef-4463-88db-98f22de89214","e2a3a72e-5f79-4c64-b1b1-878b674786c9","931e8a5d-5fa3-4bcc-b695-d7c8e4b95e9a","19dbc75e-c2e2-444c-a770-ec69d8559fc7") | ForEach-Object { try { New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -PrincipalId $sp.Id -ResourceId $graphSp.Id -AppRoleId $_ | Out-Null } catch {} }
-$exchSp = Get-MgServicePrincipal -Filter "AppId eq '00000002-0000-0ff1-ce00-000000000000'"
-try { New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -PrincipalId $sp.Id -ResourceId $exchSp.Id -AppRoleId "dc50a0fb-09a3-484d-be87-e023b12c6440" | Out-Null } catch {}
-$org = Get-MgOrganization
-$domain = ($org.VerifiedDomains | Where-Object IsDefault).Name
-Write-Host ""; Write-Host "=== COPY THESE ===" -ForegroundColor Yellow
-Write-Host "Tenant ID    : $($org.Id)"
-Write-Host "Client ID    : $($app.AppId)"
-Write-Host "Client Secret: $($secret.SecretText)"
-Write-Host "Domain       : $domain"
-"Tenant ID: $($org.Id)\nClient ID: $($app.AppId)\nSecret: $($secret.SecretText)\nDomain: $domain" | Out-File "M365Creds-$domain.txt"
-Write-Host "Saved to M365Creds-$domain.txt" -ForegroundColor Green
-Disconnect-MgGraph`;
-  res.setHeader("Content-Disposition", `attachment; filename=Register-M365App.ps1`);
-  res.setHeader("Content-Type", "text/plain");
-  res.send(script);
-});
-
-// ── Generate PowerShell script ───────────────────────────────────
-app.post("/api/generate-script", async (req, res) => {
-  const { tenantId, clientId, domain, licensedUser, mailboxes, fullAccess, sendAs, sendOnBehalf, autoMapping, resetPassword, enableSmtp } = req.body;
-  const mbRows = (mailboxes||[]).map(m=>`  @{User="${m.username}"; Name="${m.displayName}"; Password="${m.password}"}`).join(",\n");
-
-  const script = `# ================================================================
-# M365 Shared Mailbox Automation Script
-# This script creates PROPER shared mailboxes via Exchange Online
-# and assigns delegation to the licensed user.
-# ================================================================
-# REQUIREMENTS:
+  const ps = `# ============================================================
+# M365 Shared Mailbox Script
+# Auth: Tenant ID + Client ID + Client Secret
+# No interactive login required
+# ============================================================
+# REQUIREMENTS (run once):
 #   Install-Module ExchangeOnlineManagement -Force
-#   Install-Module Microsoft.Graph -Force
-#
-# HOW TO RUN:
-#   1. Open PowerShell as Administrator
-#   2. Run: .\\Create-SharedMailboxes.ps1
-#   3. Sign in when prompted (Global Admin account)
-# ================================================================
+# THEN:
+#   .\\Create-SharedMailboxes.ps1
+# ============================================================
 
-param(
-  [string]$Domain       = "${domain}",
-  [string]$LicensedUser = "${licensedUser}"
-)
+$TenantId     = "${tenantId}"
+$ClientId     = "${clientId}"
+$ClientSecret = "${clientSecret}"
+$Domain       = "${domain}"
+$LicensedUser = "${licensedUser}"
 
-$ErrorActionPreference = "Continue"
-$LogFile = "mailbox-run-$(Get-Date -Format 'yyyyMMdd-HHmm').log"
-function Log($msg, $color="White") {
-  $line = "[$(Get-Date -Format 'HH:mm:ss')] $msg"
-  Write-Host $line -ForegroundColor $color
-  Add-Content -Path $LogFile -Value $line
+$log = "run-$(Get-Date -Format 'yyyyMMdd-HHmm').log"
+function L($m, $c="White") {
+  $ts = Get-Date -Format "HH:mm:ss"
+  Write-Host "[$ts] $m" -ForegroundColor $c
+  Add-Content $log "[$ts] $m"
 }
 
-# ── Connect interactively (handles MFA automatically) ────────────
-Log "Connecting to Exchange Online..." Cyan
-Connect-ExchangeOnline -UserPrincipalName $LicensedUser -ShowBanner:$false
+# Connect to Exchange Online using Client Secret (no interactive login)
+L "Getting Exchange token..." Cyan
+$tokenBody = @{
+  grant_type    = "client_credentials"
+  client_id     = $ClientId
+  client_secret = $ClientSecret
+  scope         = "https://outlook.office365.com/.default"
+}
+$tok = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" -Body $tokenBody -ContentType "application/x-www-form-urlencoded"
+$ExchangeToken = ConvertTo-SecureString $tok.access_token -AsPlainText -Force
 
-Log "Connecting to Microsoft Graph..." Cyan
-Connect-MgGraph -Scopes "User.ReadWrite.All" -NoWelcome
+L "Connecting to Exchange Online..." Cyan
+Connect-ExchangeOnline -AppId $ClientId -Organization $Domain -AccessToken $ExchangeToken -ShowBanner:$false
+L "[OK] Connected to Exchange Online" Green
 
-$Stats = @{ Created=0; Skipped=0; Errors=0; Delegated=0 }
+$ok=0; $skip=0; $err=0; $delegated=0
 
 $Mailboxes = @(
-${mbRows}
+${rows}
 )
 
-# ── Step 1: Create shared mailboxes via Exchange directly ─────────
-Log "=== STEP 1: Creating $($Mailboxes.Count) shared mailboxes ===" Cyan
+# ── STEP 1: Create shared mailboxes ──────────────────────────────
+L "" White
+L "=== STEP 1: Creating $($Mailboxes.Count) shared mailboxes ===" Cyan
 
 foreach ($mb in $Mailboxes) {
   $upn = "$($mb.User)@$Domain"
   try {
-    $existing = Get-Mailbox -Identity $upn -ErrorAction SilentlyContinue
-    if ($existing) {
-      Log "  [SKIP] Already exists: $upn" Yellow
-      $Stats.Skipped++
+    if (Get-Mailbox -Identity $upn -ErrorAction SilentlyContinue) {
+      L "  [SKIP] Already exists: $upn" Yellow; $skip++
     } else {
-      # Create as shared mailbox directly in Exchange — appears immediately
-      New-Mailbox -Shared `
-        -Name $mb.Name `
-        -DisplayName $mb.Name `
-        -Alias $mb.User `
-        -PrimarySmtpAddress $upn | Out-Null
-      Log "  [OK] Created shared mailbox: $upn" Green
-      $Stats.Created++
-
-      ${resetPassword ? `
-      # Set password
-      try {
-        Update-MgUser -UserId $upn -PasswordProfile @{
-          Password = $mb.Password
-          ForceChangePasswordNextSignIn = $false
-        } -ErrorAction Stop
-        Log "  [OK] Password set: $upn" Green
-      } catch { Log "  [WARN] Password: $_" Yellow }` : '      # Password reset skipped'}
+      New-Mailbox -Shared -Name $mb.Name -DisplayName $mb.Name -Alias $mb.User -PrimarySmtpAddress $upn | Out-Null
+      L "  [OK] Created: $upn" Green; $ok++
     }
-  } catch {
-    Log "  [ERR] Failed to create $upn : $_" Red
-    $Stats.Errors++
-  }
+  } catch { L "  [ERR] $upn : $_" Red; $err++ }
 }
 
-# ── Step 2: Apply mailbox delegation ─────────────────────────────
-Log "" White
-Log "=== STEP 2: Applying delegation ($LicensedUser gets access to all) ===" Cyan
+# ── STEP 2: Delegate all mailboxes to licensed user ───────────────
+L "" White
+L "=== STEP 2: Delegating all mailboxes to $LicensedUser ===" Cyan
 
 foreach ($mb in $Mailboxes) {
   $upn = "$($mb.User)@$Domain"
   try {
-    $mbx = Get-Mailbox -Identity $upn -ErrorAction SilentlyContinue
-    if (!$mbx) { Log "  [SKIP] Mailbox not found: $upn" Yellow; continue }
-
-    ${fullAccess ? `
-    Add-MailboxPermission `
-      -Identity $upn `
-      -User $LicensedUser `
-      -AccessRights FullAccess `
-      -AutoMapping $${autoMapping ? 'true' : 'false'} `
-      -Confirm:$false | Out-Null
-    Log "  [OK] FullAccess: $LicensedUser → $upn" Green` : '    # FullAccess skipped'}
-
-    ${sendAs ? `
-    Add-RecipientPermission `
-      -Identity $upn `
-      -Trustee $LicensedUser `
-      -AccessRights SendAs `
-      -Confirm:$false | Out-Null
-    Log "  [OK] SendAs: $LicensedUser → $upn" Green` : '    # SendAs skipped'}
-
-    ${sendOnBehalf ? `
-    Set-Mailbox -Identity $upn -GrantSendOnBehalfTo $LicensedUser -Confirm:$false
-    Log "  [OK] SendOnBehalf: $LicensedUser → $upn" Green` : '    # SendOnBehalf skipped'}
-
-    $Stats.Delegated++
-  } catch {
-    Log "  [ERR] Delegation failed for $upn : $_" Red
-  }
+    Add-MailboxPermission -Identity $upn -User $LicensedUser -AccessRights FullAccess -AutoMapping $true -Confirm:$false | Out-Null
+    Add-RecipientPermission -Identity $upn -Trustee $LicensedUser -AccessRights SendAs -Confirm:$false | Out-Null
+    L "  [OK] Delegated: $upn -> $LicensedUser" Green; $delegated++
+  } catch { L "  [ERR] $upn : $_" Red }
 }
 
-# ── Step 3: Enable SMTP AUTH ──────────────────────────────────────
-${enableSmtp ? `
-Log "" White
-Log "=== STEP 3: Enabling SMTP AUTH ===" Cyan
-try {
-  Set-TransportConfig -SmtpClientAuthenticationDisabled $false
-  Log "[OK] SMTP AUTH enabled — Turn off SMTP is now unchecked" Green
-} catch { Log "[ERR] SMTP: $_" Red }` : '# SMTP step skipped'}
+# ── STEP 3: SMTP ──────────────────────────────────────────────────
+L "" White
+L "=== STEP 3: SMTP AUTH ===" Cyan
+${smtpLine}
 
-# ── Summary ───────────────────────────────────────────────────────
-Log "" White
-Log "================================================================" Cyan
-Log "  DONE!" Cyan
-Log "  Created  : $($Stats.Created)" Green
-Log "  Skipped  : $($Stats.Skipped)" Yellow
-Log "  Errors   : $($Stats.Errors)" $(if ($Stats.Errors -gt 0) { "Red" } else { "Green" })
-Log "  Delegated: $($Stats.Delegated)" Green
-Log "  Log file : $LogFile" White
-Log "================================================================" Cyan
+L "" White
+L "=== DONE: Created=$ok  Skipped=$skip  Errors=$err  Delegated=$delegated ===" Cyan
+L "Log saved to: $log" White
 
 Disconnect-ExchangeOnline -Confirm:$false
-Disconnect-MgGraph
 `;
 
-  res.setHeader("Content-Disposition","attachment; filename=Create-SharedMailboxes.ps1");
-  res.setHeader("Content-Type","text/plain");
-  res.send(script);
+  res.setHeader("Content-Disposition", "attachment; filename=Create-SharedMailboxes.ps1");
+  res.setHeader("Content-Type", "text/plain");
+  res.send(ps);
 });
 
-app.listen(PORT, () => console.log(`M365 Automation API v2.0 running on port ${PORT}`));
-
-// ── OAuth popup callback page ────────────────────────────────────
-app.get("/auth/callback", (req, res) => {
-  const code  = req.query.code  || '';
-  const error = req.query.error || '';
-  const data  = JSON.stringify({ type:'MS_AUTH_CALLBACK', code, error });
-  res.send(`<!DOCTYPE html><html><head><title>Signing in...</title>
-<style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#0f1117;color:#e8eaf0}</style>
-</head><body>
-<p>${error ? '❌ Login failed: ' + error : '✓ Login successful — closing window...'}</p>
-<script>
-try { window.opener && window.opener.postMessage(${data}, '*'); } catch(e){}
-setTimeout(function(){ window.close(); }, 1000);
-<\/script>
-</body></html>`);
-});
-
-// ── OAuth: Start popup login ─────────────────────────────────────
-app.post("/api/auto-setup/auth-url", async (req, res) => {
-  const { email, appName } = req.body;
-  const domain = email?.split('@')[1]?.trim();
-  if (!domain) return res.status(400).json({ success: false, message: 'Invalid email' });
-
-  // Use our own Render backend as redirect URI
-  const backendUrl = process.env.BACKEND_URL || `https://${req.headers.host}`;
-  const redirectUri = `${backendUrl}/auth/callback`;
-
-  const state = Buffer.from(JSON.stringify({ domain, appName, ts: Date.now() })).toString('base64url');
-
-  // Azure PowerShell client — broadest tenant coverage for auth code flow
-  const CLIENT_ID = '1950a258-227b-4e31-a9cf-717495945fc2';
-  const scopes = [
-    'https://graph.microsoft.com/Application.ReadWrite.All',
-    'https://graph.microsoft.com/AppRoleAssignment.ReadWrite.All',
-    'https://graph.microsoft.com/Directory.ReadWrite.All',
-    'https://graph.microsoft.com/Organization.Read.All',
-    'offline_access',
-  ].join(' ');
-
-  const authUrl = `https://login.microsoftonline.com/${domain}/oauth2/v2.0/authorize` +
-    `?client_id=${CLIENT_ID}` +
-    `&response_type=code` +
-    `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-    `&scope=${encodeURIComponent(scopes)}` +
-    `&state=${state}` +
-    `&login_hint=${encodeURIComponent(email)}` +
-    `&prompt=select_account`;
-
-  res.json({ success: true, authUrl, redirectUri, state, clientId: CLIENT_ID });
-});
-
-// ── OAuth: Exchange code for token ───────────────────────────────
-app.post("/api/auto-setup/exchange-code", async (req, res) => {
-  const { code, redirectUri, domain } = req.body;
-  const CLIENT_ID = '1950a258-227b-4e31-a9cf-717495945fc2';
-  try {
-    const params = new URLSearchParams({
-      grant_type: 'authorization_code',
-      client_id: CLIENT_ID,
-      code,
-      redirect_uri: redirectUri,
-      scope: 'https://graph.microsoft.com/Application.ReadWrite.All https://graph.microsoft.com/AppRoleAssignment.ReadWrite.All https://graph.microsoft.com/Directory.ReadWrite.All https://graph.microsoft.com/Organization.Read.All offline_access',
-    });
-    const r = await axios.post(
-      `https://login.microsoftonline.com/${domain}/oauth2/v2.0/token`,
-      params.toString(),
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
-    );
-    res.json({ success: true, access_token: r.data.access_token });
-  } catch (e) {
-    res.status(400).json({ success: false, message: e.response?.data?.error_description || e.message });
-  }
-});
+app.listen(PORT, () => console.log(`M365 API v4.0 on port ${PORT}`));
